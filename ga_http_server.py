@@ -5,55 +5,53 @@ import os
 import pkgutil
 import sys
 
-from fastmcp import FastMCP
-from fastmcp.server.auth.providers.google import GoogleProvider
-from fastmcp.server.dependencies import get_access_token
-from fastmcp.tools import Tool
-from google.oauth2.credentials import Credentials
-
-import analytics_mcp
-
+# --- 1. Config controleren (fail closed) -------------------------------------
 CLIENT_ID = os.environ.get("GA_OAUTH_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("GA_OAUTH_CLIENT_SECRET")
 BASE_URL = os.environ.get("GA_BASE_URL")
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Fail closed: zonder OAuth start de server niet.
 if not (CLIENT_ID and CLIENT_SECRET and BASE_URL):
     sys.exit("GA_OAUTH_CLIENT_ID, GA_OAUTH_CLIENT_SECRET en GA_BASE_URL zijn verplicht.")
 
+# --- 2. google.auth.default vervangen VOOR Google's code laadt ---------------
+import google.auth
+import google.auth._default
+from google.auth.exceptions import DefaultCredentialsError
+from google.oauth2.credentials import Credentials
+from fastmcp.server.dependencies import get_access_token
 
-def per_user_credentials(*args, **kwargs):
-    token = get_access_token()
-    if token is None:
-        raise PermissionError("Geen ingelogde gebruiker voor dit verzoek.")
-    return Credentials(token=token.token)
 
-
-# 1. Credentials-functie van Google vervangen (vóór het laden van de tools).
-patched = []
-for mod_name in ("analytics_mcp.tools.utils", "analytics_mcp.tools.client"):
+def per_user_default(*args, **kwargs):
+    """Geeft de credentials van de ingelogde gebruiker i.p.v. ADC."""
+    token = None
     try:
-        mod = importlib.import_module(mod_name)
-    except ImportError:
-        continue
-    for fn_name in ("_create_credentials", "_get_credentials"):
-        if hasattr(mod, fn_name):
-            setattr(mod, fn_name, per_user_credentials)
-            patched.append(f"{mod_name}.{fn_name}")
+        token = get_access_token()
+    except Exception:  # noqa: BLE001
+        token = None
+    if token is None:
+        raise DefaultCredentialsError("Geen ingelogde gebruiker voor dit verzoek.")
+    return Credentials(token=token.token), None
 
-if not patched:
-    sys.exit("Geen credentials-functie gevonden om te vervangen. Server start niet.")
-print("Credentials vervangen in:", ", ".join(patched), flush=True)
 
-# 2. Alle modules van Google's package laden.
+google.auth.default = per_user_default
+google.auth._default.default = per_user_default
+print("google.auth.default vervangen door per-user login", flush=True)
+
+# --- 3. Google's package en alle modules laden -------------------------------
+import analytics_mcp  # noqa: E402
+
 for info in pkgutil.walk_packages(analytics_mcp.__path__, "analytics_mcp."):
     try:
         importlib.import_module(info.name)
     except Exception as e:  # noqa: BLE001
         print(f"Overgeslagen: {info.name} ({e})", flush=True)
 
-# 3. Alle server-objecten zoeken (tools-modules eerst).
+# --- 4. Server-objecten en tools verzamelen ----------------------------------
+from fastmcp import FastMCP  # noqa: E402
+from fastmcp.server.auth.providers.google import GoogleProvider  # noqa: E402
+from fastmcp.tools import Tool  # noqa: E402
+
 module_names = sorted(
     (n for n in list(sys.modules) if n == "analytics_mcp" or n.startswith("analytics_mcp.")),
     key=lambda n: (not n.startswith("analytics_mcp.tools"), n),
@@ -99,11 +97,12 @@ tools = asyncio.run(collect_all())
 if not tools:
     coord = sys.modules.get("analytics_mcp.coordinator")
     print("Servers gevonden:", len(servers), flush=True)
+    print("Modules:", module_names, flush=True)
     print("Inhoud coordinator:",
           [n for n in dir(coord) if not n.startswith("__")] if coord else None, flush=True)
     sys.exit("Geen tools gevonden. Server start niet.")
 
-# 4. Nieuwe server met Google-login en de tools van Google.
+# --- 5. Nieuwe server met Google-login en de tools van Google ----------------
 auth = GoogleProvider(
     client_id=CLIENT_ID,
     client_secret=CLIENT_SECRET,
