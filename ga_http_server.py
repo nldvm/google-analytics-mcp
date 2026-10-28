@@ -1,8 +1,6 @@
-"""HTTP + Google OAuth wrapper rond de officiële analytics-mcp tools."""
-import asyncio
+"""HTTP + Google OAuth wrapper rond de officiële analytics-mcp tools (v0.8+)."""
 import importlib
 import os
-import pkgutil
 import sys
 
 # --- 1. Config controleren (fail closed) -------------------------------------
@@ -24,7 +22,6 @@ from fastmcp.server.dependencies import get_access_token
 
 def per_user_default(*args, **kwargs):
     """Geeft de credentials van de ingelogde gebruiker i.p.v. ADC."""
-    token = None
     try:
         token = get_access_token()
     except Exception:  # noqa: BLE001
@@ -38,71 +35,56 @@ google.auth.default = per_user_default
 google.auth._default.default = per_user_default
 print("google.auth.default vervangen door per-user login", flush=True)
 
-# --- 3. Google's package en alle modules laden -------------------------------
-import analytics_mcp  # noqa: E402
+# --- 3. Read-only tools uit Google's coordinator halen -----------------------
+coordinator = importlib.import_module("analytics_mcp.coordinator")
 
-for info in pkgutil.walk_packages(analytics_mcp.__path__, "analytics_mcp."):
+
+def resolve_func(name):
+    return (getattr(coordinator, f"{name}_with_description", None)
+            or getattr(coordinator, name, None))
+
+
+entries = {}
+
+rt = getattr(coordinator, "read_only_tools", None)
+if callable(rt) and not isinstance(rt, (list, tuple)):
     try:
-        importlib.import_module(info.name)
-    except Exception as e:  # noqa: BLE001
-        print(f"Overgeslagen: {info.name} ({e})", flush=True)
+        rt = rt()
+    except TypeError:
+        rt = None
 
-# --- 4. Server-objecten en tools verzamelen ----------------------------------
+for item in (rt or []):
+    if isinstance(item, str):
+        name, func, desc = item, resolve_func(item), None
+    else:
+        func = getattr(item, "func", None)
+        name = getattr(item, "name", None) or getattr(func, "__name__", None)
+        if func is None and name:
+            func = resolve_func(name)
+        desc = getattr(item, "description", None)
+    if not name or not callable(func):
+        continue
+    name = name.removesuffix("_with_description")
+    entries.setdefault(name, (func, desc))
+
+# Terugvaloptie: de lijst met read-only toolnamen.
+if not entries:
+    for name in getattr(coordinator, "_READ_ONLY_TOOL_NAMES", None) or []:
+        func = resolve_func(name)
+        if callable(func):
+            entries.setdefault(name, (func, None))
+
+if not entries:
+    print("Type read_only_tools:", type(getattr(coordinator, "read_only_tools", None)), flush=True)
+    print("Voorbeeld:", repr((rt or [None])[0])[:300] if rt else None, flush=True)
+    print("_READ_ONLY_TOOL_NAMES:", getattr(coordinator, "_READ_ONLY_TOOL_NAMES", None), flush=True)
+    sys.exit("Geen tools gevonden. Server start niet.")
+
+# --- 4. Nieuwe server met Google-login en de tools van Google ----------------
 from fastmcp import FastMCP  # noqa: E402
 from fastmcp.server.auth.providers.google import GoogleProvider  # noqa: E402
 from fastmcp.tools import Tool  # noqa: E402
 
-module_names = sorted(
-    (n for n in list(sys.modules) if n == "analytics_mcp" or n.startswith("analytics_mcp.")),
-    key=lambda n: (not n.startswith("analytics_mcp.tools"), n),
-)
-servers = []
-for name in module_names:
-    for obj in vars(sys.modules[name]).values():
-        if type(obj).__name__ == "FastMCP" and all(obj is not s for s in servers):
-            servers.append(obj)
-
-
-async def tools_of(server):
-    tm = getattr(server, "_tool_manager", None)
-    result = None
-    if tm is not None and hasattr(tm, "list_tools"):
-        result = tm.list_tools()
-    else:
-        for attr in ("get_tools", "list_tools"):
-            if hasattr(server, attr):
-                result = getattr(server, attr)()
-                break
-    if asyncio.iscoroutine(result):
-        result = await result
-    if result is None:
-        return []
-    return list(result.values() if isinstance(result, dict) else result)
-
-
-async def collect_all():
-    found, seen = [], set()
-    for s in servers:
-        for t in await tools_of(s):
-            fn = getattr(t, "fn", None)
-            if fn is None or id(fn) in seen:
-                continue
-            seen.add(id(fn))
-            found.append(t)
-    return found
-
-
-tools = asyncio.run(collect_all())
-
-if not tools:
-    coord = sys.modules.get("analytics_mcp.coordinator")
-    print("Servers gevonden:", len(servers), flush=True)
-    print("Modules:", module_names, flush=True)
-    print("Inhoud coordinator:",
-          [n for n in dir(coord) if not n.startswith("__")] if coord else None, flush=True)
-    sys.exit("Geen tools gevonden. Server start niet.")
-
-# --- 5. Nieuwe server met Google-login en de tools van Google ----------------
 auth = GoogleProvider(
     client_id=CLIENT_ID,
     client_secret=CLIENT_SECRET,
@@ -116,9 +98,12 @@ auth = GoogleProvider(
 
 app = FastMCP("Google Analytics", auth=auth)
 
-for t in tools:
-    app.add_tool(Tool.from_function(t.fn, name=t.name, description=t.description))
-    print(f"Tool geladen: {t.name}", flush=True)
+for name, (func, desc) in entries.items():
+    if not desc:
+        extra = getattr(coordinator, f"_{name}_description", None)
+        desc = extra if isinstance(extra, str) else (func.__doc__ or "").strip() or None
+    app.add_tool(Tool.from_function(func, name=name, description=desc))
+    print(f"Tool geladen: {name}", flush=True)
 
 if __name__ == "__main__":
     app.run(transport="http", host="0.0.0.0", port=PORT)
