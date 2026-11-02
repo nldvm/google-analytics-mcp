@@ -35,6 +35,13 @@ google.auth.default = per_user_default
 google.auth._default.default = per_user_default
 print("google.auth.default vervangen door per-user login", flush=True)
 
+# Google's _ClientManager cachet credentials per proces: het token van de eerste
+# gebruiker zou voor iedereen hergebruikt worden en na ~1 uur verlopen (401).
+# Daarom bij elke client opnieuw het token van de huidige gebruiker ophalen.
+from analytics_mcp.tools import client as ga_client  # noqa: E402
+
+ga_client._ClientManager._get_credentials = lambda self: per_user_default()[0]
+
 # --- 3. Read-only tools uit Google's coordinator halen -----------------------
 coordinator = importlib.import_module("analytics_mcp.coordinator")
 
